@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+
+# ---------- Stage 1: сборка зависимостей ----------
+# Фиксированная версия slim-образа: воспроизводимая сборка и малый размер
+FROM python:3.12.8-slim-bookworm AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Зависимости ставим в отдельный venv, который целиком переносим в финальный образ
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Сначала копируем только requirements.txt — слой с зависимостями
+# кэшируется и не пересобирается при изменении кода
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+
+# ---------- Stage 2: финальный runtime-образ ----------
+FROM python:3.12.8-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    DATA_DIR=/app/data
+
+# Отдельный непривилегированный пользователь вместо root
+RUN groupadd --system --gid 10001 app \
+ && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
+
+WORKDIR /app
+
+# Из builder берём только готовый venv — без pip-кэша и инструментов сборки
+COPY --from=builder /opt/venv /opt/venv
+
+# Код принадлежит root и доступен приложению только на чтение
+COPY app/ ./app/
+
+# Каталог для данных — сюда монтируется volume; права только у app
+RUN mkdir -p "$DATA_DIR" && chown app:app "$DATA_DIR"
+
+USER app
+
+EXPOSE 8000
+
+# Docker сам следит за состоянием сервиса (в Kubernetes будет liveness/readiness probe)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+
+# exec-форма: uvicorn — PID 1 и корректно получает SIGTERM при docker stop
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
