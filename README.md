@@ -104,6 +104,29 @@ docker logs notes-bad
 docker image ls notes-api
 ```
 
+### Результаты локальной проверки
+
+Оба образа собраны в Docker Desktop (Linux, amd64). Для каждого образа
+`POST /notes` вернул HTTP 201, а `GET /notes` после пересоздания контейнера
+с тем же именованным томом вернул ту же заметку и время её создания.
+У `notes-api:good` Docker также показал статус `healthy`.
+
+| Образ | Размер на диске | Размер содержимого |
+|-------|-----------------|---------------------|
+| `notes-api:good` | 226 МБ | 54,5 МБ |
+| `notes-api:bad` | 1,79 ГБ | 467 МБ |
+
+По выводу `docker image ls notes-api` плохой образ занял примерно в 7,9 раза
+больше места на диске.
+
+![Фрагменты логов успешной сборки обоих образов](screenshots/docker-builds.png)
+
+![Ответы API до и после пересоздания контейнера, логи uvicorn](screenshots/volume-and-logs.png)
+
+![Swagger UI работающего контейнера notes-api:bad](screenshots/swagger-ui.png)
+
+![Вывод docker image ls с размерами обоих образов](screenshots/image-sizes.png)
+
 ## Плохие практики в Dockerfile.bad и их исправление
 
 | # | Плохая практика | Почему это плохо | Как исправлено в Dockerfile.good |
