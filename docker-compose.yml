@@ -1,0 +1,75 @@
+name: notes
+
+# Общие настройки образа приложения: их используют init-сервис migrate и API.
+x-notes-image: &notes-image
+  build:
+    context: .
+    dockerfile: Dockerfile.good
+  image: notes-api:2.0.0
+  env_file: .env
+  networks:
+    - notes-net
+
+services:
+  # --- База данных ---
+  db:
+    image: postgres:16.6-alpine
+    container_name: notes-db
+    env_file: .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - notes-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # --- Одноразовый init-сервис: создаёт схему БД и завершается ---
+  migrate:
+    <<: *notes-image
+    container_name: notes-migrate
+    command: ["python", "-m", "app.migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      disable: true # HEALTHCHECK из Dockerfile не нужен процессу, который сразу завершается
+    restart: "no"
+
+  # --- Приложение ---
+  app:
+    <<: *notes-image
+    container_name: notes-api
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${APP_PORT}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+    restart: unless-stopped
+
+networks:
+  notes-net:
+    name: notes-net
+    driver: bridge
+
+volumes:
+  pgdata:
+    name: notes-pgdata

@@ -1,21 +1,31 @@
-# ЛР 1. Dockerfile
+# Notes API — лабораторные по контейнеризации (ITMO)
 
 **Команда:** Firat Karatasoglu, Yahya
 
+| ЛР | Тема | Раздел |
+|----|------|--------|
+| 1 | Dockerfile | [ЛР 1. Dockerfile](#лр-1-dockerfile) |
+| 2 | Docker Compose | [ЛР 2. Docker Compose](#лр-2-docker-compose) |
+
+История изменений — в [CHANGES.md](CHANGES.md).
+
 ## Приложение
 
-**Notes API** — небольшой REST-сервис заметок на FastAPI. Заметки хранятся в
-SQLite-файле в каталоге `/app/data`, который монтируется как **volume**, —
-поэтому данные не теряются при пересоздании контейнера.
+**Notes API** — небольшой REST-сервис заметок на FastAPI. Хранилище
+выбирается переменными окружения:
 
-Приложение выбрано с расчётом на следующие лабораторные: SQLite легко
-заменить на PostgreSQL, конфигурация передаётся через переменные окружения,
-а эндпоинт `/health` пригодится для liveness/readiness probe в Kubernetes.
+- **без `DB_HOST`** (ЛР 1) — SQLite-файл в каталоге `/app/data`, который
+  монтируется как **volume**;
+- **с `DB_HOST`** (ЛР 2) — PostgreSQL в отдельном контейнере, схему БД
+  создаёт одноразовый init-сервис.
+
+Эндпоинт `/health` используется в healthcheck и пригодится для
+liveness/readiness probe в Kubernetes.
 
 | Метод    | Путь           | Описание                     |
 |----------|----------------|------------------------------|
-| `GET`    | `/`            | Информация о сервисе         |
-| `GET`    | `/health`      | Проверка состояния           |
+| `GET`    | `/`            | Информация о сервисе и типе хранилища |
+| `GET`    | `/health`      | Проверка состояния (в том числе БД) |
 | `GET`    | `/notes`       | Список заметок               |
 | `POST`   | `/notes`       | Создать заметку `{"text": "..."}` |
 | `GET`    | `/notes/{id}`  | Получить заметку             |
@@ -28,13 +38,23 @@ SQLite-файле в каталоге `/app/data`, который монтиру
 .
 ├── app/
 │   ├── __init__.py
-│   └── main.py          # код приложения
+│   ├── main.py          # HTTP API
+│   ├── db.py            # доступ к БД: SQLite или PostgreSQL
+│   └── migrate.py       # создание схемы БД (init-сервис в ЛР 2)
 ├── requirements.txt     # зафиксированные версии зависимостей
-├── Dockerfile.good      # хороший Dockerfile
-├── Dockerfile.bad       # плохой Dockerfile
+├── Dockerfile.good      # хороший Dockerfile (ЛР 1, используется в ЛР 2)
+├── Dockerfile.bad       # плохой Dockerfile (ЛР 1)
+├── docker-compose.yml   # ЛР 2
+├── .env                 # переменные окружения для docker compose (ЛР 2)
 ├── .dockerignore
+├── screenshots/
+├── CHANGES.md
 └── README.md
 ```
+
+---
+
+# ЛР 1. Dockerfile
 
 ## Сборка и запуск (хороший Dockerfile)
 
@@ -179,3 +199,79 @@ docker image ls notes-api
    отключения промышленной установки используют выделенный контроллер с ОС
    реального времени. Обычный Docker-контейнер на ОС общего назначения
    разделяет планировщик с другими процессами, поэтому сам по себе таких гарантий не даёт.
+
+---
+
+# ЛР 2. Docker Compose
+
+Compose-проект из трёх сервисов на основе `Dockerfile.good` из ЛР 1:
+
+| Сервис | Контейнер | Роль |
+|--------|-----------|------|
+| `db` | `notes-db` | PostgreSQL 16, данные в именованном volume `notes-pgdata` |
+| `migrate` | `notes-migrate` | **init-сервис**: один раз создаёт схему БД и завершается с кодом 0 |
+| `app` | `notes-api` | Notes API, порт 8000 проброшен наружу |
+
+Порядок запуска: `db` становится `healthy` → `migrate` отрабатывает и
+завершается → стартует `app`.
+
+## Запуск
+
+```bash
+docker compose up -d --build
+docker compose ps -a
+```
+
+Ожидаемый результат:
+
+```
+NAME            IMAGE                  STATUS                      PORTS
+notes-api       notes-api:2.0.0        Up 20 seconds (healthy)     0.0.0.0:8000->8000/tcp
+notes-db        postgres:16.6-alpine   Up 30 seconds (healthy)     5432/tcp
+notes-migrate   notes-api:2.0.0        Exited (0) 20 seconds ago
+```
+
+Проверка:
+
+```bash
+docker logs notes-migrate
+# [migrate] backend: postgres
+# [migrate] schema is up to date, notes in table: 0
+
+curl localhost:8000/
+# {"service":"notes-api","version":"2.0.0","storage":"postgres","docs":"/docs"}
+
+curl -X POST localhost:8000/notes -H 'Content-Type: application/json' -d '{"text":"compose + postgres"}'
+curl localhost:8000/notes
+```
+
+Данные хранятся в volume, поэтому переживают `docker compose down`:
+
+```bash
+docker compose down
+docker compose up -d
+curl localhost:8000/notes   # заметка на месте
+```
+
+Полная очистка вместе с данными: `docker compose down -v`.
+
+> Файл `.env` лежит в репозитории, потому что этого требует задание.
+> В реальном проекте в git хранят только `.env.example` с примерами значений,
+> а настоящий `.env` добавляют в `.gitignore`. В образ `.env` не попадает:
+> он указан в `.dockerignore`.
+
+## Описание docker-compose.yml
+
+<!-- TODO (Яхья): описать каждый сервис и ключ compose-файла
+     (build + image, container_name, depends_on с condition, volumes, ports,
+     command, healthcheck, env_file, networks, deploy.resources, restart) -->
+
+## Ответы на вопросы
+
+### Можно ли ограничивать ресурсы (память, CPU) для сервисов в docker-compose.yml?
+
+<!-- TODO (Яхья) -->
+
+### Как запустить только определённый сервис из docker-compose.yml?
+
+<!-- TODO (Яхья) -->

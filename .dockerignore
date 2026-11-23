@@ -15,6 +15,10 @@ data/
 
 # Документация и сами Dockerfile не нужны внутри образа
 *.md
+
+# Секреты: .env читает docker compose, в образ он попадать не должен
+.env
+.env.*
 Dockerfile*
 screenshots/
 
