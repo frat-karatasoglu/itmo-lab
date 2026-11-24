@@ -13,6 +13,8 @@
   (`Dockerfile.good`), и для Python 3.15, который сейчас приходит с
   `python:latest` (`Dockerfile.bad`).
 - Версия API: 2.0.0. Поле `created_at` теперь отдаётся в формате ISO 8601.
+- В README добавлены разделы «Описание docker-compose.yml» и «Ответы на вопросы»,
+  а также результаты локального запуска и скриншоты `screenshots/lab2-*.png`.
 
 ## ЛР 1. Dockerfile
 
