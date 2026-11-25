@@ -1,0 +1,15 @@
+# Внутренний адрес БД в кластере: postgres-service:5432.
+# ClusterIP вместо NodePort из примера: базе данных не нужен доступ снаружи кластера.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: postgres

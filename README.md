@@ -6,6 +6,7 @@
 |----|------|--------|
 | 1 | Dockerfile | [ЛР 1. Dockerfile](#лр-1-dockerfile) |
 | 2 | Docker Compose | [ЛР 2. Docker Compose](#лр-2-docker-compose) |
+| 3 | Kubernetes | [ЛР 3. Kubernetes](#лр-3-kubernetes) |
 
 История изменений — в [CHANGES.md](CHANGES.md).
 
@@ -46,6 +47,7 @@ liveness/readiness probe в Kubernetes.
 ├── Dockerfile.bad       # плохой Dockerfile (ЛР 1)
 ├── docker-compose.yml   # ЛР 2
 ├── .env                 # переменные окружения для docker compose (ЛР 2)
+├── k8s/                 # манифесты Kubernetes (ЛР 3)
 ├── .dockerignore
 ├── screenshots/
 ├── CHANGES.md
@@ -489,3 +491,156 @@ PS C:\Masaüstü\itmo-lab> docker compose run --rm --no-deps app python -c "prin
  Container notes-app-run-58ab7ff11cc3  Created
 one-off command, no app container started
 ```
+
+---
+
+# ЛР 3. Kubernetes
+
+В кластере minikube разворачивается Nextcloud с БД PostgreSQL. За основу
+взяты манифесты из задания. В них внесены изменения, которых требует задание,
+и несколько исправлений, без которых пример работает нестабильно.
+
+## Манифесты (`k8s/`)
+
+| Файл | Объекты | Назначение |
+|------|---------|------------|
+| `pg_configmap.yml` | ConfigMap `postgres-configmap` | `POSTGRES_DB` |
+| `pg_secret.yml` | Secret `postgres-secret` | `POSTGRES_USER`, `POSTGRES_PASSWORD` |
+| `pg_service.yml` | Service `postgres-service` (ClusterIP) | адрес БД внутри кластера |
+| `pg_deployment.yml` | Deployment `postgres` | PostgreSQL 14 |
+| `nextcloud.yml` | Secret `nextcloud-secret`, ConfigMap `nextcloud-configmap`, Deployment `nextcloud` | Nextcloud с пробами |
+| `nextcloud_service.yml` | Service `nextcloud` (NodePort) | доступ к Nextcloud снаружи |
+
+## Что изменено по заданию
+
+1. **PostgreSQL: логин и пароль перенесены из ConfigMap в Secret.**
+   В `postgres-configmap` остался только `POSTGRES_DB`. `POSTGRES_USER` и
+   `POSTGRES_PASSWORD` лежат в новом `postgres-secret`. Postgres получает
+   обе сущности через `envFrom` (`configMapRef` + `secretRef`), а Nextcloud
+   берёт логин и пароль БД из того же секрета через `secretKeyRef`.
+2. **Nextcloud: переменные перенесены из Deployment в ConfigMap.**
+   `NEXTCLOUD_UPDATE`, `ALLOW_EMPTY_PASSWORD`, `POSTGRES_HOST`,
+   `NEXTCLOUD_TRUSTED_DOMAINS` и `NEXTCLOUD_ADMIN_USER` теперь находятся в
+   `nextcloud-configmap` и подключаются через `envFrom`. В `env` Deployment'а
+   остались только ссылки на чужие ConfigMap/Secret: `POSTGRES_DB`,
+   `POSTGRES_USER`, `POSTGRES_PASSWORD`, `NEXTCLOUD_ADMIN_PASSWORD`.
+3. **Nextcloud: добавлены пробы.** Все три проверяют `GET /status.php`:
+
+   | Проба | Что делает | Параметры |
+   |-------|-----------|-----------|
+   | `startupProbe` | Ждёт окончания первой установки Nextcloud. Пока она не прошла, остальные пробы не запускаются | раз в 10 с, до 60 неудач (10 минут) |
+   | `livenessProbe` | Если Apache перестал отвечать, kubelet перезапускает контейнер | раз в 15 с, 3 неудачи подряд |
+   | `readinessProbe` | Пока проба не проходит, под исключается из Endpoints сервиса и не получает трафик | раз в 10 с, 3 неудачи подряд |
+
+   `startupProbe` нужна потому, что первая установка Nextcloud длится
+   несколько минут, и всё это время Apache не слушает порт 80. С одной только
+   `livenessProbe` kubelet перезапускал бы контейнер посреди установки, и под
+   ушёл бы в `CrashLoopBackOff`.
+
+   Пробы отправляют заголовок `Host: localhost`. Nextcloud может отвечать
+   ошибкой на запросы с недоверенным доменом, а kubelet по умолчанию подставляет IP
+   пода, поэтому `localhost` добавлен в `NEXTCLOUD_TRUSTED_DOMAINS`.
+
+### Дополнительные исправления примера
+
+- **Service БД — `ClusterIP` вместо `NodePort`.** Базе данных не нужен доступ
+  снаружи кластера, Nextcloud обращается к ней по имени `postgres-service`.
+- **Лимит памяти Nextcloud поднят с 256Mi до 768Mi.** 256Mi впритык для первой
+  установки Nextcloud, и контейнер может быть убит по OOM (`OOMKilled`).
+- **`NEXTCLOUD_TRUSTED_DOMAINS`** содержит `localhost` (для проб), `127.0.0.1`
+  (`minikube service` с драйвером docker на Windows/macOS) и `192.168.49.2`
+  (IP ноды minikube по умолчанию, проверить: `minikube ip`).
+- **Service Nextcloud описан манифестом** `nextcloud_service.yml`, поэтому
+  `kubectl expose` не нужен. Используйте что-то одно: оба способа создают
+  сервис с именем `nextcloud`.
+- Пароли в секретах — заглушки `change_me_*`. Перед запуском их стоит заменить.
+
+## Запуск
+
+```bash
+minikube start
+kubectl config current-context        # minikube
+
+kubectl create -f k8s/pg_configmap.yml
+kubectl create -f k8s/pg_secret.yml
+kubectl create -f k8s/pg_service.yml
+kubectl create -f k8s/pg_deployment.yml
+kubectl create -f k8s/nextcloud.yml
+kubectl create -f k8s/nextcloud_service.yml
+# или всё сразу: kubectl apply -f k8s/
+
+kubectl get pods -w                    # ждём 1/1 Running у обоих подов
+kubectl logs deployment/nextcloud -f   # ждём "Nextcloud was successfully installed"
+minikube service nextcloud             # откроет Nextcloud в браузере
+```
+
+Логин — `admin`, пароль — значение `NEXTCLOUD_ADMIN_PASSWORD` из `nextcloud-secret`.
+
+Удаление: `kubectl delete -f k8s/`.
+
+## Ход работы
+
+<!-- TODO (Яхья): по шагам со скриншотами:
+     minikube start, docker ps, kubectl config view;
+     kubectl create -f ... для каждого манифеста;
+     kubectl get configmap / secret / service / pods;
+     kubectl describe secret/postgres-secret (значения скрыты);
+     kubectl describe pod <nextcloud> — блок Liveness/Readiness/Startup;
+     kubectl logs <nextcloud> — "Nextcloud was successfully installed";
+     minikube service nextcloud + страница входа и после входа;
+     minikube dashboard (по желанию);
+     эксперимент со scale postgres 0 → 1 (см. вопрос 2). -->
+
+## Ответы на вопросы
+
+### 1. Важен ли порядок выполнения манифестов? Почему?
+
+Отчасти важен.
+
+- **ConfigMap и Secret нужно создать раньше Deployment, который на них
+  ссылается.** Если Deployment создан первым, под не стартует и висит в
+  статусе `CreateContainerConfigError` (`configmap "..." not found`). Когда
+  ConfigMap/Secret появятся, kubelet сам повторит попытку и под запустится,
+  так что ошибка не фатальная, но лучше её не допускать.
+- **Порядок Service и Deployment не важен.** Service находит поды по label
+  `selector` и обновляет Endpoints, когда поды появляются или исчезают.
+  Единственное следствие: переменные окружения вида `POSTGRES_SERVICE_HOST`
+  попадают только в поды, созданные после Service. Наши манифесты обращаются
+  к сервису по DNS-имени (`postgres-service`), поэтому их это не касается.
+- **Порядок БД и Nextcloud важен на практике.** Если Nextcloud стартует
+  раньше, чем PostgreSQL готов принимать соединения, первая установка может
+  завершиться ошибкой. Поэтому сначала создаётся БД, а Nextcloud — после
+  того, как под `postgres` перешёл в `Running`.
+
+`kubectl apply -f k8s/` применяет файлы каталога в алфавитном порядке. У нас
+это `nextcloud.yml` → `nextcloud_service.yml` → `pg_configmap.yml` →
+`pg_deployment.yml` → `pg_secret.yml` → `pg_service.yml`, то есть Nextcloud
+создаётся раньше БД и её ConfigMap/Secret. Поды какое-то время побудут в
+`CreateContainerConfigError`, а потом запустятся сами. Для предсказуемости в
+инструкции выше файлы создаются по одному в правильном порядке.
+
+### 2. Что произойдёт, если отскейлить postgres в 0, затем обратно в 1, и снова зайти в Nextcloud?
+
+```bash
+kubectl scale deployment postgres --replicas=0
+kubectl scale deployment postgres --replicas=1
+```
+
+**Nextcloud перестанет работать** и покажет ошибку (`Internal Server Error`
+или сообщение о проблемах с БД).
+
+Причина в том, что у PostgreSQL **нет постоянного хранилища**: каталог
+`/var/lib/postgresql/data` находится в файловой системе контейнера. При
+`replicas=0` под удаляется вместе со всеми данными. При `replicas=1`
+создаётся новый под с **пустой** БД: entrypoint образа postgres заново
+создаёт пользователя и базу `nextcloud`, но без таблиц.
+
+Nextcloud при этом продолжает работать в старом поде. Его `config.php`
+говорит, что установка уже выполнена (`installed => true`), поэтому
+переустановку он не запускает, а обращается к таблицам, которых больше нет.
+
+Как исправить: хранить данные PostgreSQL в **PersistentVolumeClaim**,
+смонтированном в `/var/lib/postgresql/data`, а для БД вместо Deployment
+использовать **StatefulSet**. Тогда после scale 0 → 1 новый под подключит тот
+же том и данные сохранятся.
+

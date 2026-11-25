@@ -1,0 +1,10 @@
+# Несекретные настройки PostgreSQL.
+# POSTGRES_USER и POSTGRES_PASSWORD перенесены в Secret (pg_secret.yml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-configmap
+  labels:
+    app: postgres
+data:
+  POSTGRES_DB: "nextcloud"

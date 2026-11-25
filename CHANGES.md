@@ -1,5 +1,15 @@
 # CHANGES
 
+## ЛР 3. Kubernetes
+
+- Добавлен каталог `k8s/` с манифестами Nextcloud + PostgreSQL на основе примера из задания.
+- `POSTGRES_USER` и `POSTGRES_PASSWORD` перенесены из ConfigMap в Secret `postgres-secret`.
+- Переменные Nextcloud перенесены из Deployment в ConfigMap `nextcloud-configmap`.
+- Для Nextcloud добавлены `startupProbe`, `livenessProbe` и `readinessProbe` (`/status.php`).
+- Service БД переведён на ClusterIP, лимит памяти Nextcloud поднят до 768Mi,
+  Service Nextcloud описан манифестом `nextcloud_service.yml`.
+- В README добавлен раздел «ЛР 3» с описанием изменений и ответами на вопросы.
+
 ## ЛР 2. Docker Compose
 
 - Добавлен `docker-compose.yml` из трёх сервисов: `db` (PostgreSQL 16),

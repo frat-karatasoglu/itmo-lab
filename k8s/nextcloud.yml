@@ -1,0 +1,126 @@
+# Nextcloud: Secret с паролем администратора, ConfigMap с настройками
+# и Deployment с liveness/readiness/startup пробами.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nextcloud-secret
+  labels:
+    app: nextcloud
+type: Opaque
+stringData:
+  NEXTCLOUD_ADMIN_PASSWORD: "change_me_admin_password"
+---
+# Все несекретные переменные Nextcloud, которые в примере были в Deployment.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextcloud-configmap
+  labels:
+    app: nextcloud
+data:
+  NEXTCLOUD_UPDATE: "1"
+  ALLOW_EMPTY_PASSWORD: "yes"
+  POSTGRES_HOST: "postgres-service"
+  # Через пробел. localhost нужен пробам (см. httpHeaders ниже),
+  # 127.0.0.1 — для `minikube service` с драйвером docker на Windows/macOS,
+  # 192.168.49.2 — IP ноды minikube по умолчанию (проверить: `minikube ip`).
+  NEXTCLOUD_TRUSTED_DOMAINS: "localhost 127.0.0.1 192.168.49.2"
+  NEXTCLOUD_ADMIN_USER: "admin"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud
+  labels:
+    app: nextcloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nextcloud
+  template:
+    metadata:
+      labels:
+        app: nextcloud
+    spec:
+      containers:
+        - name: nextcloud
+          image: docker.io/nextcloud:stable-apache
+          imagePullPolicy: IfNotPresent
+          resources:
+            # 256Mi из примера мало для первичной установки Nextcloud (OOMKilled)
+            limits:
+              cpu: 1000m
+              memory: 768Mi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          # NEXTCLOUD_UPDATE, ALLOW_EMPTY_PASSWORD, POSTGRES_HOST,
+          # NEXTCLOUD_TRUSTED_DOMAINS, NEXTCLOUD_ADMIN_USER
+          envFrom:
+            - configMapRef:
+                name: nextcloud-configmap
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-configmap
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: NEXTCLOUD_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-secret
+                  key: NEXTCLOUD_ADMIN_PASSWORD
+          # Первая установка Nextcloud занимает несколько минут, и всё это время
+          # Apache ещё не слушает порт 80. startupProbe даёт на это до 10 минут
+          # (60 × 10 с); пока она не прошла, liveness и readiness не запускаются,
+          # поэтому kubelet не перезапускает контейнер посреди установки.
+          startupProbe:
+            httpGet:
+              path: /status.php
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost # должен входить в NEXTCLOUD_TRUSTED_DOMAINS
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          # Жив ли процесс: если /status.php не отвечает ~45 с, контейнер перезапускается.
+          livenessProbe:
+            httpGet:
+              path: /status.php
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Готов ли под принимать трафик: пока проба не проходит,
+          # под исключается из Endpoints сервиса nextcloud.
+          readinessProbe:
+            httpGet:
+              path: /status.php
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
