@@ -602,15 +602,12 @@ kubectl get nodes
 * Verifying Kubernetes components...
 * Enabled addons: storage-provisioner, default-storageclass
 * Done! kubectl is now configured to use "minikube" cluster
-
-minikube
-
-NAME       STATUS   ROLES           AGE     VERSION
-minikube   Ready    control-plane   3m27s   v1.37.0
 ```
 
 Сам кластер — это контейнер в Docker: `docker ps` показывает контейнер
-`minikube` с образом `gcr.io/k8s-minikube/kicbase`.
+`minikube` с образом `gcr.io/k8s-minikube/kicbase`. Состояние поднятого
+кластера (`minikube status`, текущий контекст, `kubectl get nodes`) видно на
+скриншоте в следующем разделе.
 
 ### 2. Создание манифестов по порядку
 
@@ -648,22 +645,24 @@ kubectl get configmap,secret,service
 
 ```
 NAME                            DATA   AGE
-configmap/kube-root-ca.crt      1      3m11s
+configmap/kube-root-ca.crt      1      4h35m
 configmap/nextcloud-configmap   5      0s
-configmap/postgres-configmap    1      6s
+configmap/postgres-configmap    1      1s
 
 NAME                      TYPE     DATA   AGE
 secret/nextcloud-secret   Opaque   1      0s
-secret/postgres-secret    Opaque   2      6s
+secret/postgres-secret    Opaque   2      1s
 
-NAME                       TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)        AGE
-service/kubernetes         ClusterIP   10.96.0.1        <none>        443/TCP        3m18s
-service/nextcloud          NodePort    10.111.20.220    <none>        80:30988/TCP   0s
-service/postgres-service   ClusterIP   10.100.236.217   <none>        5432/TCP       6s
+NAME                       TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+service/kubernetes         ClusterIP   10.96.0.1       <none>        443/TCP        4h35m
+service/nextcloud          NodePort    10.106.45.95    <none>        80:32556/TCP   0s
+service/postgres-service   ClusterIP   10.99.71.82     <none>        5432/TCP       1s
 ```
 
 Видно, что `postgres-service` — `ClusterIP` (наружу не публикуется), а
-`nextcloud` — `NodePort` с портом ноды `30988`.
+`nextcloud` — `NodePort` с портом ноды `32556`.
+
+![minikube status, текущий контекст, создание манифестов и список объектов](screenshots/lab3-create.png)
 
 ### 4. Секрет: значения не показываются
 
@@ -692,6 +691,8 @@ POSTGRES_USER:      9 bytes
 в манифесте Deployment, не попадает в `describe` и права на него выдаются
 отдельно через RBAC.
 
+![kubectl get pods, describe secret postgres-secret и лог Nextcloud](screenshots/lab3-pods.png)
+
 ### 5. Пробы Nextcloud
 
 ```powershell
@@ -711,17 +712,19 @@ Startup:    http-get http://:http/status.php delay=0s timeout=5s period=10s #suc
 Все три пробы применились. В событиях пода видно, зачем нужна `startupProbe`:
 
 ```
-Warning  Unhealthy  39s (x12 over 2m29s)  kubelet
-  Startup probe failed: Get "http://10.244.0.4:80/status.php":
-  dial tcp 10.244.0.4:80: connect: connection refused
+Warning  Unhealthy  73s  kubelet  pod/nextcloud-7bf984646f-z75mr
+  Startup probe failed: Get "http://10.244.0.5:80/status.php":
+  dial tcp 10.244.0.5:80: connect: connection refused
 ```
 
-Пока Nextcloud разворачивался, проба **12 раз подряд** получила
-`connection refused` — Apache ещё не слушал порт 80. `startupProbe` допускает
-до 60 таких неудач, поэтому контейнер не был перезапущен и дошёл до
-готовности. Если бы вместо неё работала только `livenessProbe`
-(`failureThreshold: 3`), kubelet убил бы контейнер примерно через 45 секунд и
+Пока Nextcloud разворачивался, проба получала `connection refused` — Apache
+ещё не слушал порт 80. `startupProbe` допускает до 60 таких неудач подряд
+(10 минут), поэтому контейнер не был перезапущен и дошёл до готовности. Если
+бы вместо неё работала только `livenessProbe` (`failureThreshold: 3`,
+`periodSeconds: 15`), kubelet убил бы контейнер примерно через 45 секунд и
 под ушёл бы в `CrashLoopBackOff`.
+
+![Пробы из describe pod, события с результатом startup-пробы и лог установки](screenshots/lab3-probes.png)
 
 ### 6. Поды и лог установки
 
@@ -731,21 +734,21 @@ kubectl logs deployment/nextcloud
 ```
 
 ```
-NAME                         READY   STATUS    RESTARTS   AGE     IP           NODE
-nextcloud-7bf984646f-bsjps   1/1     Running   0          8m30s   10.244.0.4   minikube
-postgres-848ffcb678-hhrzj    1/1     Running   0          8m36s   10.244.0.3   minikube
+NAME                         READY   STATUS    RESTARTS   AGE   IP           NODE
+nextcloud-7bf984646f-z75mr   1/1     Running   0          12m   10.244.0.5   minikube
+postgres-848ffcb678-hnjwc    1/1     Running   0          12m   10.244.0.4   minikube
 
-=> Configuring PHP session handler...
 Initializing nextcloud 34.0.6.2 ...
 New nextcloud instance
 Nextcloud was successfully installed
 Initializing finished
 ```
 
-Оба пода `1/1 Running`, перезапусков нет. По времени: образ
-`nextcloud:stable-apache` (513 МБ) скачивался 4 мин 29 с, после старта
-контейнера установка заняла ещё около 2 минут — всего примерно 7 минут от
-`kubectl create` до `READY 1/1`.
+Оба пода `1/1 Running`, перезапусков нет. По времени (из событий): образ
+`postgres:14` (163 МБ) скачивался 4 мин 25 с, образ
+`nextcloud:stable-apache` (513 МБ) — 5 мин 43 с (10 мин 8 с вместе с
+ожиданием в очереди), после старта контейнера установка заняла ещё около
+двух минут.
 
 ### 7. Доступ к Nextcloud
 
@@ -754,13 +757,13 @@ minikube service nextcloud --url
 ```
 
 ```
-http://127.0.0.1:53573
+http://127.0.0.1:64559
 ! Because you are using a Docker driver on windows, the terminal needs to be open to run it.
 ```
 
 С драйвером `docker` на Windows `minikube service` поднимает туннель на
 `127.0.0.1` со случайным портом, и терминал с этой командой нужно оставить
-открытым. Напрямую на `http://192.168.49.2:30988` с хоста зайти нельзя —
+открытым. Напрямую на `http://192.168.49.2:32556` с хоста зайти нельзя —
 поэтому `127.0.0.1` и указан в `NEXTCLOUD_TRUSTED_DOMAINS`.
 
 Страница входа и интерфейс после входа (логин `admin`, пароль — значение
@@ -779,40 +782,79 @@ kubectl scale deployment postgres --replicas=1
 kubectl get pods
 ```
 
+Сначала убеждаемся, что таблицы на месте:
+
+```
+                    List of relations
+ Schema |            Name             | Type  |  Owner
+--------+-----------------------------+-------+----------
+ public | oc_accounts                 | table | oc_admin
+ public | oc_accounts_data            | table | oc_admin
+ public | oc_activity                 | table | oc_admin
+```
+
+Затем сам эксперимент:
+
 ```
 deployment.apps/postgres scaled
 NAME                         READY   STATUS    RESTARTS   AGE
-nextcloud-7bf984646f-bsjps   1/1     Running   0          11m
+nextcloud-7bf984646f-z75mr   1/1     Running   0          14m
 
 deployment.apps/postgres scaled
 NAME                         READY   STATUS    RESTARTS   AGE
-nextcloud-7bf984646f-bsjps   1/1     Running   0          11m
-postgres-848ffcb678-smz2z    1/1     Running   0          3s
-```
+nextcloud-7bf984646f-z75mr   1/1     Running   0          14m
+postgres-848ffcb678-9srr9    1/1     Running   0          20s
 
-Обратите внимание на имя пода: вместо `postgres-848ffcb678-hhrzj` появился
-**новый** под `postgres-848ffcb678-smz2z`. Старый удалён вместе со своей
-файловой системой, а с ней — и с каталогом `/var/lib/postgresql/data`.
-
-Проверяем таблицы в новой БД:
-
-```powershell
-kubectl exec <новый под postgres> -- psql -U nextcloud -d nextcloud -c "\dt"
-```
-
-```
+--- таблицы в новом поде postgres ---
 Did not find any relations.
 ```
 
-База `nextcloud` создана заново и **пуста**: ни одной таблицы. Под Nextcloud
-при этом не перезапускался, его `config.php` по-прежнему считает установку
-выполненной, поэтому он обращается к несуществующим таблицам и отдаёт
-HTTP 500:
+Обратите внимание на имя пода: вместо `postgres-848ffcb678-hnjwc` появился
+**новый** под `postgres-848ffcb678-9srr9`. Старый удалён вместе со своей
+файловой системой, а с ней — и с каталогом `/var/lib/postgresql/data`.
+База `nextcloud` создана заново и пуста: ни одной таблицы.
+(`Did not find any relations.` psql пишет в stderr, поэтому PowerShell
+подсвечивает строку красным.)
+
+![Таблицы до эксперимента, scale 0 → 1 и пустая БД после него](screenshots/lab3-scale.png)
+
+#### Что происходит с Nextcloud дальше
+
+Под Nextcloud не пересоздавался, его `config.php` по-прежнему считает
+установку выполненной, поэтому он обращается к несуществующим таблицам и
+отдаёт HTTP 500:
 
 ![Nextcloud после scale postgres 0 → 1: Internal Server Error](screenshots/lab3-scale-error.png)
 
-Это ровно то, что описано в ответе на вопрос 2: без PersistentVolumeClaim и
-StatefulSet данные БД живут только внутри пода и исчезают вместе с ним.
+Дальше в дело вступают пробы, и это хорошо видно в кластере:
+
+```
+NAME                         READY   STATUS    RESTARTS      AGE
+nextcloud-7bf984646f-z75mr   0/1     Running   1 (36s ago)   15m
+postgres-848ffcb678-9srr9    1/1     Running   0             64s
+
+NAME        ENDPOINTS   AGE
+nextcloud               15m
+
+Warning  Unhealthy  Readiness probe failed: HTTP probe failed with statuscode: 500
+Warning  Unhealthy  Liveness probe failed: HTTP probe failed with statuscode: 500
+```
+
+1. `readinessProbe` получает 500 → под уходит из `Endpoints` сервиса
+   (колонка `ENDPOINTS` пустая), и `minikube service nextcloud` начинает
+   отдавать `ERR_CONNECTION_RESET`: трафик просто некуда направлять.
+2. `livenessProbe` получает 500 три раза подряд → kubelet перезапускает
+   контейнер (`RESTARTS 1`).
+3. После перезапуска entrypoint образа видит пустую базу и **ставит
+   Nextcloud заново**: в логе снова появляется `Nextcloud was successfully
+   installed`, таблицы `oc_*` создаются с нуля, под опять становится `1/1`.
+
+![Пробы после эксперимента: 500, пустые Endpoints и перезапуск контейнера](screenshots/lab3-scale-probes.png)
+
+То есть сервис в итоге сам поднимается, но это **новая пустая установка**:
+все прежние данные потеряны безвозвратно. Это ровно то, о чём ответ на
+вопрос 2: без PersistentVolumeClaim и StatefulSet данные БД живут только
+внутри пода и исчезают вместе с ним.
 
 ### 9. Удаление
 
