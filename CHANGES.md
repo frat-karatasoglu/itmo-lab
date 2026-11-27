@@ -9,6 +9,8 @@
 - Service БД переведён на ClusterIP, лимит памяти Nextcloud поднят до 768Mi,
   Service Nextcloud описан манифестом `nextcloud_service.yml`.
 - В README добавлен раздел «ЛР 3» с описанием изменений и ответами на вопросы.
+- Добавлен раздел «Ход работы» с реальным выводом команд, скриншотами
+  `screenshots/lab3-*.png` и проверкой эксперимента `scale postgres` 0 → 1.
 
 ## ЛР 2. Docker Compose
 
