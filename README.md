@@ -580,16 +580,288 @@ minikube service nextcloud             # откроет Nextcloud в брауз�
 
 ## Ход работы
 
-<!-- TODO (Яхья): по шагам со скриншотами:
-     minikube start, docker ps, kubectl config view;
-     kubectl create -f ... для каждого манифеста;
-     kubectl get configmap / secret / service / pods;
-     kubectl describe secret/postgres-secret (значения скрыты);
-     kubectl describe pod <nextcloud> — блок Liveness/Readiness/Startup;
-     kubectl logs <nextcloud> — "Nextcloud was successfully installed";
-     minikube service nextcloud + страница входа и после входа;
-     minikube dashboard (по желанию);
-     эксперимент со scale postgres 0 → 1 (см. вопрос 2). -->
+Проверка выполнена на Windows 11 (Docker Desktop, Docker Engine 29.8.2),
+minikube v1.39.0, драйвер `docker`, Kubernetes v1.37.0, `kubectl` v1.36.1.
+Ниже — реальный вывод команд.
+
+### 1. Запуск кластера
+
+```powershell
+minikube start --driver=docker
+kubectl config current-context
+kubectl get nodes
+```
+
+```
+* minikube v1.39.0 on Microsoft Windows 11 Pro 26H2
+* Using the docker driver based on user configuration
+* Starting "minikube" primary control-plane node in "minikube" cluster
+* Pulling base image v0.0.51 ...
+* Preparing Kubernetes v1.37.0 on containerd 2.3.4 ...
+* Configuring CNI (Container Networking Interface) ...
+* Verifying Kubernetes components...
+* Enabled addons: storage-provisioner, default-storageclass
+* Done! kubectl is now configured to use "minikube" cluster
+```
+
+Сам кластер — это контейнер в Docker: `docker ps` показывает контейнер
+`minikube` с образом `gcr.io/k8s-minikube/kicbase`. Состояние поднятого
+кластера (`minikube status`, текущий контекст, `kubectl get nodes`) видно на
+скриншоте в следующем разделе.
+
+### 2. Создание манифестов по порядку
+
+Порядок важен (см. вопрос 1): сначала ConfigMap и Secret, затем Service и
+Deployment базы, и только потом Nextcloud.
+
+```powershell
+kubectl create -f k8s/pg_configmap.yml
+kubectl create -f k8s/pg_secret.yml
+kubectl create -f k8s/pg_service.yml
+kubectl create -f k8s/pg_deployment.yml
+kubectl create -f k8s/nextcloud.yml
+kubectl create -f k8s/nextcloud_service.yml
+```
+
+```
+configmap/postgres-configmap created
+secret/postgres-secret created
+service/postgres-service created
+deployment.apps/postgres created
+secret/nextcloud-secret created
+configmap/nextcloud-configmap created
+deployment.apps/nextcloud created
+service/nextcloud created
+```
+
+Все объекты созданы без ошибок `configmap "..." not found`, потому что
+ConfigMap и Secret появились раньше Deployment'ов.
+
+### 3. Проверка созданных объектов
+
+```powershell
+kubectl get configmap,secret,service
+```
+
+```
+NAME                            DATA   AGE
+configmap/kube-root-ca.crt      1      4h35m
+configmap/nextcloud-configmap   5      0s
+configmap/postgres-configmap    1      1s
+
+NAME                      TYPE     DATA   AGE
+secret/nextcloud-secret   Opaque   1      0s
+secret/postgres-secret    Opaque   2      1s
+
+NAME                       TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+service/kubernetes         ClusterIP   10.96.0.1       <none>        443/TCP        4h35m
+service/nextcloud          NodePort    10.106.45.95    <none>        80:32556/TCP   0s
+service/postgres-service   ClusterIP   10.99.71.82     <none>        5432/TCP       1s
+```
+
+Видно, что `postgres-service` — `ClusterIP` (наружу не публикуется), а
+`nextcloud` — `NodePort` с портом ноды `32556`.
+
+![minikube status, текущий контекст, создание манифестов и список объектов](screenshots/lab3-create.png)
+
+### 4. Секрет: значения не показываются
+
+```powershell
+kubectl describe secret postgres-secret
+```
+
+```
+Name:         postgres-secret
+Namespace:    default
+Labels:       app=postgres
+Annotations:  <none>
+
+Type:  Opaque
+
+Data
+====
+POSTGRES_PASSWORD:  21 bytes
+POSTGRES_USER:      9 bytes
+```
+
+`describe` выводит только имена ключей и размер значений. Это не шифрование:
+в etcd Secret хранится в base64, и значение при необходимости достаётся
+командой `kubectl get secret postgres-secret -o jsonpath='{.data.POSTGRES_USER}'`
+с последующим декодированием base64. Смысл Secret в другом: значение не видно
+в манифесте Deployment, не попадает в `describe` и права на него выдаются
+отдельно через RBAC.
+
+![kubectl get pods, describe secret postgres-secret и лог Nextcloud](screenshots/lab3-pods.png)
+
+### 5. Пробы Nextcloud
+
+```powershell
+kubectl describe pod -l app=nextcloud
+```
+
+```
+Image:      docker.io/nextcloud:stable-apache
+Limits:       cpu: 1        memory: 768Mi
+Requests:     cpu: 250m     memory: 256Mi
+
+Liveness:   http-get http://:http/status.php delay=0s timeout=5s period=15s #success=1 #failure=3
+Readiness:  http-get http://:http/status.php delay=0s timeout=5s period=10s #success=1 #failure=3
+Startup:    http-get http://:http/status.php delay=0s timeout=5s period=10s #success=1 #failure=60
+```
+
+Все три пробы применились. В событиях пода видно, зачем нужна `startupProbe`:
+
+```
+Warning  Unhealthy  73s  kubelet  pod/nextcloud-7bf984646f-z75mr
+  Startup probe failed: Get "http://10.244.0.5:80/status.php":
+  dial tcp 10.244.0.5:80: connect: connection refused
+```
+
+Пока Nextcloud разворачивался, проба получала `connection refused` — Apache
+ещё не слушал порт 80. `startupProbe` допускает до 60 таких неудач подряд
+(10 минут), поэтому контейнер не был перезапущен и дошёл до готовности. Если
+бы вместо неё работала только `livenessProbe` (`failureThreshold: 3`,
+`periodSeconds: 15`), kubelet убил бы контейнер примерно через 45 секунд и
+под ушёл бы в `CrashLoopBackOff`.
+
+![Пробы из describe pod, события с результатом startup-пробы и лог установки](screenshots/lab3-probes.png)
+
+### 6. Поды и лог установки
+
+```powershell
+kubectl get pods -o wide
+kubectl logs deployment/nextcloud
+```
+
+```
+NAME                         READY   STATUS    RESTARTS   AGE   IP           NODE
+nextcloud-7bf984646f-z75mr   1/1     Running   0          12m   10.244.0.5   minikube
+postgres-848ffcb678-hnjwc    1/1     Running   0          12m   10.244.0.4   minikube
+
+Initializing nextcloud 34.0.6.2 ...
+New nextcloud instance
+Nextcloud was successfully installed
+Initializing finished
+```
+
+Оба пода `1/1 Running`, перезапусков нет. По времени (из событий): образ
+`postgres:14` (163 МБ) скачивался 4 мин 25 с, образ
+`nextcloud:stable-apache` (513 МБ) — 5 мин 43 с (10 мин 8 с вместе с
+ожиданием в очереди), после старта контейнера установка заняла ещё около
+двух минут.
+
+### 7. Доступ к Nextcloud
+
+```powershell
+minikube service nextcloud --url
+```
+
+```
+http://127.0.0.1:64559
+! Because you are using a Docker driver on windows, the terminal needs to be open to run it.
+```
+
+С драйвером `docker` на Windows `minikube service` поднимает туннель на
+`127.0.0.1` со случайным портом, и терминал с этой командой нужно оставить
+открытым. Напрямую на `http://192.168.49.2:32556` с хоста зайти нельзя —
+поэтому `127.0.0.1` и указан в `NEXTCLOUD_TRUSTED_DOMAINS`.
+
+Страница входа и интерфейс после входа (логин `admin`, пароль — значение
+`NEXTCLOUD_ADMIN_PASSWORD` из `nextcloud-secret`):
+
+![Страница входа Nextcloud через minikube service](screenshots/lab3-nextcloud-login.png)
+
+![Nextcloud после входа: приложение «Файлы» с данными по умолчанию](screenshots/lab3-nextcloud-files.png)
+
+### 8. Эксперимент: `scale postgres` 0 → 1
+
+```powershell
+kubectl scale deployment postgres --replicas=0
+kubectl get pods
+kubectl scale deployment postgres --replicas=1
+kubectl get pods
+```
+
+Сначала убеждаемся, что таблицы на месте:
+
+```
+                    List of relations
+ Schema |            Name             | Type  |  Owner
+--------+-----------------------------+-------+----------
+ public | oc_accounts                 | table | oc_admin
+ public | oc_accounts_data            | table | oc_admin
+ public | oc_activity                 | table | oc_admin
+```
+
+Затем сам эксперимент:
+
+```
+deployment.apps/postgres scaled
+NAME                         READY   STATUS    RESTARTS   AGE
+nextcloud-7bf984646f-z75mr   1/1     Running   0          14m
+
+deployment.apps/postgres scaled
+NAME                         READY   STATUS    RESTARTS   AGE
+nextcloud-7bf984646f-z75mr   1/1     Running   0          14m
+postgres-848ffcb678-9srr9    1/1     Running   0          20s
+
+--- таблицы в новом поде postgres ---
+Did not find any relations.
+```
+
+Обратите внимание на имя пода: вместо `postgres-848ffcb678-hnjwc` появился
+**новый** под `postgres-848ffcb678-9srr9`. Старый удалён вместе со своей
+файловой системой, а с ней — и с каталогом `/var/lib/postgresql/data`.
+База `nextcloud` создана заново и пуста: ни одной таблицы.
+(`Did not find any relations.` psql пишет в stderr, поэтому PowerShell
+подсвечивает строку красным.)
+
+![Таблицы до эксперимента, scale 0 → 1 и пустая БД после него](screenshots/lab3-scale.png)
+
+#### Что происходит с Nextcloud дальше
+
+Под Nextcloud не пересоздавался, его `config.php` по-прежнему считает
+установку выполненной, поэтому он обращается к несуществующим таблицам и
+отдаёт HTTP 500:
+
+![Nextcloud после scale postgres 0 → 1: Internal Server Error](screenshots/lab3-scale-error.png)
+
+Дальше в дело вступают пробы, и это хорошо видно в кластере:
+
+```
+NAME                         READY   STATUS    RESTARTS      AGE
+nextcloud-7bf984646f-z75mr   0/1     Running   1 (36s ago)   15m
+postgres-848ffcb678-9srr9    1/1     Running   0             64s
+
+NAME        ENDPOINTS   AGE
+nextcloud               15m
+
+Warning  Unhealthy  Readiness probe failed: HTTP probe failed with statuscode: 500
+Warning  Unhealthy  Liveness probe failed: HTTP probe failed with statuscode: 500
+```
+
+1. `readinessProbe` получает 500 → под уходит из `Endpoints` сервиса
+   (колонка `ENDPOINTS` пустая), и `minikube service nextcloud` начинает
+   отдавать `ERR_CONNECTION_RESET`: трафик просто некуда направлять.
+2. `livenessProbe` получает 500 три раза подряд → kubelet перезапускает
+   контейнер (`RESTARTS 1`).
+3. После перезапуска entrypoint образа видит пустую базу и **ставит
+   Nextcloud заново**: в логе снова появляется `Nextcloud was successfully
+   installed`, таблицы `oc_*` создаются с нуля, под опять становится `1/1`.
+
+![Пробы после эксперимента: 500, пустые Endpoints и перезапуск контейнера](screenshots/lab3-scale-probes.png)
+
+То есть сервис в итоге сам поднимается, но это **новая пустая установка**:
+все прежние данные потеряны безвозвратно. Это ровно то, о чём ответ на
+вопрос 2: без PersistentVolumeClaim и StatefulSet данные БД живут только
+внутри пода и исчезают вместе с ним.
+
+### 9. Удаление
+
+```powershell
+kubectl delete -f k8s/
+minikube delete
+```
 
 ## Ответы на вопросы
 
