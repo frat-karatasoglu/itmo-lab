@@ -1072,17 +1072,305 @@ Swagger UI: `<url>/docs`. Логи init-контейнеров:
 
 ## Ход работы
 
-<!-- TODO (Яхья): по шагам со скриншотами:
-     minikube image build + minikube image ls (кастомный образ);
-     kubectl apply -f k8s/notes/;
-     kubectl get pods -w: Init:0/2 → Init:1/2 → PodInitializing → Running;
-     kubectl logs <api-pod> -c wait-for-db и -c migrate;
-     kubectl get all,pvc,configmap,secret -l app.kubernetes.io/part-of=notes;
-     kubectl get pods --show-labels;
-     kubectl describe pod <api-pod> — Init Containers, Liveness, Readiness;
-     curl/Swagger: POST и GET /notes через minikube service;
-     эксперимент с PVC: kubectl scale deployment notes-db --replicas=0, затем 1 —
-       заметки на месте (сравнить с ЛР 3);
-     эксперимент с пробами: при replicas=0 у notes-db поды notes-api 0/1,
-       RESTARTS не растёт; после возврата БД снова 1/1. -->
+Проверка выполнена на Windows 11 (Docker Desktop, Docker Engine 29.8.2),
+minikube v1.39.0, драйвер `docker`, Kubernetes v1.37.0, `kubectl` v1.36.1.
+Перед началом объекты ЛР 3 из кластера удалены, чтобы в выводе остался
+только наш проект. Ниже — реальный вывод команд.
+
+### 1. Сборка собственного образа внутри minikube
+
+```powershell
+minikube image build -t notes-api:2.1.0 -f Dockerfile.good .
+minikube image ls | findstr notes-api
+```
+
+```
+#16 exporting to image
+#16 exporting manifest sha256:be1969b906c93c6746cb6a52a7e05c0b731f558ac8d4a0209c259ed66500c247 done
+#16 naming to docker.io/library/notes-api:2.1.0 done
+#16 DONE 0.0s
+
+docker.io/library/postgres:16.6-alpine
+docker.io/library/notes-api:2.1.0
+```
+
+Образ собран **прямо в minikube**, поэтому registry не нужен и
+`imagePullPolicy: IfNotPresent` находит его локально. На скриншоте сборка
+повторная, поэтому все слои `CACHED`. Вывод buildkit идёт в stderr —
+PowerShell подсвечивает его красным, ошибкой это не является.
+
+![minikube image build и minikube image ls с собственным образом notes-api:2.1.0](screenshots/lab4-image-build.png)
+
+### 2. Создание объектов и работа init-контейнеров
+
+```powershell
+kubectl apply -f k8s/notes/
+kubectl get pods -l app.kubernetes.io/part-of=notes -w
+```
+
+```
+secret/notes-db-secret created
+configmap/notes-config created
+persistentvolumeclaim/notes-db-data created
+deployment.apps/notes-db created
+service/notes-db created
+deployment.apps/notes-api created
+service/notes-api created
+
+NAME                        READY   STATUS              RESTARTS   AGE
+notes-api-78b9dcbc49-l66bq  0/1     Init:0/2            0          0s
+notes-api-78b9dcbc49-pnsz8  0/1     Init:0/2            0          0s
+notes-db-76f9f6d58b-vz4dh   0/1     ContainerCreating   0          0s
+notes-db-76f9f6d58b-vz4dh   0/1     Running             0          0s
+notes-db-76f9f6d58b-vz4dh   1/1     Running             0          6s
+notes-api-78b9dcbc49-pnsz8  0/1     Init:1/2            0          7s
+notes-api-78b9dcbc49-l66bq  0/1     Init:1/2            0          7s
+notes-api-78b9dcbc49-pnsz8  0/1     PodInitializing     0          9s
+notes-api-78b9dcbc49-l66bq  0/1     PodInitializing     0          9s
+notes-api-78b9dcbc49-pnsz8  0/1     Running             0          9s
+notes-api-78b9dcbc49-l66bq  1/1     Running             0          15s
+notes-api-78b9dcbc49-pnsz8  1/1     Running             0          15s
+```
+
+Здесь хорошо виден весь порядок:
+
+- `Init:0/2` — поды API ждут, первый init-контейнер `wait-for-db` крутит
+  `pg_isready`, пока БД не готова;
+- как только `notes-db` становится `1/1 Running` (6 с), оба пода переходят в
+  `Init:1/2` (7 с) — отработал `wait-for-db`, пошёл `migrate`;
+- `PodInitializing` (9 с) — init-контейнеры закончились, стартует `api`;
+- `1/1 Running` (15 с) — readiness-проба `/health` прошла.
+
+Это и есть замена `depends_on: condition: service_healthy` из ЛР 2: в
+Kubernetes зависимостей между Deployment'ами нет, порядок обеспечивают
+init-контейнеры.
+
+![kubectl apply и переходы Init:0/2 → Init:1/2 → PodInitializing → Running](screenshots/lab4-apply-watch.png)
+
+### 3. Логи init-контейнеров
+
+```powershell
+kubectl logs <api-pod> -c wait-for-db
+kubectl logs <api-pod> -c migrate
+```
+
+```
+notes-db:5432 - no response
+waiting for notes-db:5432...
+notes-db:5432 - no response
+waiting for notes-db:5432...
+notes-db:5432 - no response
+waiting for notes-db:5432...
+notes-db:5432 - accepting connections
+
+[migrate] backend: postgres
+[migrate] schema is up to date, notes in table: 0
+```
+
+Второй под дал ровно такой же вывод `migrate`: обе реплики мигрировали
+одновременно и обе завершились с кодом 0 — advisory-блокировка PostgreSQL
+отработала, конфликта нет.
+
+В логе основного контейнера видно, что обе пробы ходят и получают 200:
+
+```
+INFO:  10.244.0.1:58152 - "GET /health HTTP/1.1" 200 OK
+INFO:  10.244.0.1:55682 - "GET / HTTP/1.1" 200 OK
+```
+
+![Логи wait-for-db, migrate обеих реплик и запросы проб в логе api](screenshots/lab4-init-logs.png)
+
+### 4. Созданные объекты и лейблы
+
+```powershell
+kubectl get all,pvc,configmap,secret -l app.kubernetes.io/part-of=notes
+kubectl get pods --show-labels
+```
+
+```
+NAME                             READY   STATUS    RESTARTS   AGE
+pod/notes-api-78b9dcbc49-l66bq   1/1     Running   0          3m36s
+pod/notes-api-78b9dcbc49-pnsz8   1/1     Running   0          3m36s
+pod/notes-db-76f9f6d58b-vz4dh    1/1     Running   0          3m36s
+
+NAME                TYPE        CLUSTER-IP       PORT(S)        AGE
+service/notes-api   NodePort    10.104.75.193    80:30080/TCP   3m36s
+service/notes-db    ClusterIP   10.101.194.235   5432/TCP       3m36s
+
+NAME                        READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/notes-api   2/2     2            2           3m36s
+deployment.apps/notes-db    1/1     1            1           3m36s
+
+NAME                                     STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+persistentvolumeclaim/notes-db-data      Bound    pvc-b1f72396-6ec8-40b1-83c8-c0a2bfc2231a   1Gi        RWO            standard
+
+NAME                     DATA   AGE          NAME                     TYPE     DATA   AGE
+configmap/notes-config   3      3m36s        secret/notes-db-secret   Opaque   2      3m36s
+```
+
+Один селектор `-l app.kubernetes.io/part-of=notes` вытаскивает **весь**
+проект: поды, сервисы, Deployment'ы, ReplicaSet'ы, PVC, ConfigMap и Secret.
+Ради этого рекомендуемые лейблы и проставлены на всех объектах, а не только
+те, что нужны селектору Deployment'а:
+
+```
+notes-api-78b9dcbc49-l66bq  LABELS: app.kubernetes.io/component=api,
+  app.kubernetes.io/name=notes-api, app.kubernetes.io/part-of=notes,
+  app.kubernetes.io/version=2.1.0, app=notes-api, pod-template-hash=78b9dcbc49
+notes-db-76f9f6d58b-vz4dh   LABELS: app.kubernetes.io/component=database,
+  app.kubernetes.io/name=notes-db, app.kubernetes.io/part-of=notes,
+  app=notes-db, pod-template-hash=76f9f6d58b
+```
+
+![kubectl get all,pvc,configmap,secret по лейблу и kubectl get pods --show-labels](screenshots/lab4-resources.png)
+
+### 5. `kubectl describe pod` — init-контейнеры и пробы
+
+```
+Init Containers:
+  wait-for-db:
+    Image:          postgres:16.6-alpine
+    State:          Terminated
+      Exit Code:    0
+    Ready:          True
+  migrate:
+    Image:          notes-api:2.1.0
+    State:          Terminated
+      Exit Code:    0
+    Ready:          True
+Containers:
+  api:
+    Image:          notes-api:2.1.0
+    State:          Running
+    Ready:          True
+    Restart Count:  0
+    Limits:    cpu: 500m   memory: 256Mi
+    Requests:  cpu: 100m   memory: 128Mi
+    Liveness:   http-get http://:http/       delay=10s timeout=3s period=15s #failure=3
+    Readiness:  http-get http://:http/health delay=0s  timeout=3s period=5s  #failure=3
+Conditions:
+  Initialized      True
+  Ready            True
+  ContainersReady  True
+  PodScheduled     True
+```
+
+Оба init-контейнера в состоянии `Terminated` с кодом 0 — именно так и должно
+быть: они отработали один раз и больше не запускаются. Видно и разделение
+проб: `liveness` смотрит на `/`, `readiness` — на `/health`.
+
+![describe pod: init-контейнеры с Exit Code 0, лимиты и обе пробы](screenshots/lab4-describe.png)
+
+### 6. Проверка API
+
+```powershell
+minikube service notes-api --url     # http://127.0.0.1:55306
+curl <url>/
+curl -X POST <url>/notes -H "Content-Type: application/json" -d "{\"text\":\"from-k8s\"}"
+curl <url>/notes
+```
+
+```
+{"service":"notes-api","version":"2.1.0","storage":"postgres","docs":"/docs"}
+
+{"text":"from-k8s","id":1,"created_at":"2026-11-27T15:27:09.214301Z"}
+HTTP 201
+{"text":"lab4-pvc-test","id":2,"created_at":"2026-11-27T15:27:09.308565Z"}
+HTTP 201
+
+[{"text":"from-k8s","id":1,...},{"text":"lab4-pvc-test","id":2,...}]
+
+{"status":"ok","storage":"postgres"}
+```
+
+![POST и GET /notes через minikube service, ответы / и /health](screenshots/lab4-api-test.png)
+
+Swagger UI по адресу `<url>/docs`:
+
+![Swagger UI Notes API 2.1.0, запущенного в Kubernetes](screenshots/lab4-swagger.png)
+
+### 7. Эксперимент: `scale notes-db` 0 → 1
+
+Один эксперимент проверяет сразу две вещи: поведение проб при недоступной БД
+и сохранность данных на PVC.
+
+```powershell
+kubectl scale deployment notes-db --replicas=0
+kubectl get pods -l app.kubernetes.io/part-of=notes
+kubectl get endpoints notes-api
+```
+
+```
+NAME                         READY   STATUS    RESTARTS   AGE
+notes-api-78b9dcbc49-l66bq   0/1     Running   0          5m57s
+notes-api-78b9dcbc49-pnsz8   0/1     Running   0          5m57s
+
+NAME        ENDPOINTS   AGE
+notes-api               5m57s
+```
+
+**Пробы ведут себя именно так, как задумано:**
+
+- `readinessProbe` (`/health`) не проходит → оба пода становятся `0/1` и
+  уходят из `Endpoints` сервиса. Снаружи API недоступен — это правильно,
+  отдавать 500 клиентам смысла нет;
+- `livenessProbe` (`/`) продолжает проходить → **`RESTARTS` остаётся 0**.
+  Поды не перезапускаются, они просто ждут возвращения БД.
+
+Проверяем это напрямую, минуя сервис (`kubectl port-forward` в под):
+
+```
+GET /        -> HTTP 200
+GET /health  -> HTTP 500
+```
+
+Ровно то, ради чего пробы разведены по разным эндпоинтам. В ЛР 3 liveness-проба
+Nextcloud зависела от БД, и kubelet убил контейнер; здесь этого не происходит.
+
+Возвращаем БД:
+
+```powershell
+kubectl scale deployment notes-db --replicas=1
+```
+
+```
+NAME                         READY   STATUS    RESTARTS   AGE
+notes-api-78b9dcbc49-l66bq   1/1     Running   0          6m49s
+notes-api-78b9dcbc49-pnsz8   1/1     Running   0          6m49s
+notes-db-76f9f6d58b-85dm2    1/1     Running   0          46s
+```
+
+Поды API — **те же самые** (имена и возраст не изменились), `RESTARTS` по-прежнему
+0, и они сами вернулись в `1/1`, как только readiness-проба снова прошла.
+
+![Пробы при выключенной БД: 0/1, пустые Endpoints, RESTARTS 0, / 200 и /health 500](screenshots/lab4-probe-test.png)
+
+**Данные на месте.** Под БД новый (`notes-db-76f9f6d58b-85dm2`, 46 секунд), но
+PVC тот же самый:
+
+```
+NAME            STATUS   VOLUME                                     CAPACITY   ACCESS MODES   AGE
+notes-db-data   Bound    pvc-b1f72396-6ec8-40b1-83c8-c0a2bfc2231a   1Gi        RWO            7m33s
+
+GET /notes
+[{"text":"from-k8s","id":1,...},{"text":"lab4-pvc-test","id":2,...}]
+
+ id |     text
+----+---------------
+  1 | from-k8s
+  2 | lab4-pvc-test
+(2 rows)
+```
+
+Это **противоположность ЛР 3**: там у PostgreSQL не было тома, и после
+`scale 0 → 1` база оказывалась пустой. Здесь каталог `/var/lib/postgresql/data`
+лежит на PVC `notes-db-data`, поэтому пересоздание пода данные не трогает.
+
+![PVC не изменился, обе заметки на месте после пересоздания пода БД](screenshots/lab4-pvc-test.png)
+
+### 8. Удаление
+
+```powershell
+kubectl delete -f k8s/notes/
+```
 
