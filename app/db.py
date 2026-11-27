@@ -89,5 +89,19 @@ def execute(query: str, params: tuple = ()) -> int:
         return cur.rowcount
 
 
+# Произвольный, но постоянный ключ advisory-блокировки для миграций
+MIGRATION_LOCK_KEY = 2024_0001
+
+
 def init_schema() -> None:
-    execute(SCHEMA_POSTGRES if is_postgres() else SCHEMA_SQLITE)
+    if not is_postgres():
+        execute(SCHEMA_SQLITE)
+        return
+    # Несколько реплик (например, init-контейнеры двух подов в Kubernetes) могут
+    # запустить миграцию одновременно. Параллельные CREATE TABLE IF NOT EXISTS
+    # в PostgreSQL иногда падают с ошибкой уникальности в системном каталоге,
+    # поэтому миграция выполняется под транзакционной advisory-блокировкой:
+    # второй процесс ждёт, пока первый закоммитит, и видит готовую таблицу.
+    with _cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_LOCK_KEY,))
+        cur.execute(SCHEMA_POSTGRES)

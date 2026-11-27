@@ -1,0 +1,90 @@
+# PostgreSQL: Deployment + Service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notes-db
+  labels:
+    app: notes-db
+    app.kubernetes.io/name: notes-db
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: notes
+    app.kubernetes.io/version: "16.6"
+spec:
+  replicas: 1
+  # ReadWriteOnce-том можно смонтировать только в один под: старый под
+  # должен остановиться раньше, чем стартует новый.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: notes-db
+  template:
+    metadata:
+      labels:
+        app: notes-db
+        app.kubernetes.io/name: notes-db
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: notes
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16.6-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - configMapRef:
+                name: notes-config # POSTGRES_DB
+            - secretRef:
+                name: notes-db-secret # POSTGRES_USER, POSTGRES_PASSWORD
+          env:
+            # Данные в подкаталоге тома: в корне тома может лежать lost+found,
+            # и initdb отказывается работать в непустом каталоге.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: notes-db-data
+---
+# Внутренний адрес БД: notes-db:5432. Снаружи кластера БД не видна.
+apiVersion: v1
+kind: Service
+metadata:
+  name: notes-db
+  labels:
+    app.kubernetes.io/name: notes-db
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: notes
+spec:
+  type: ClusterIP
+  selector:
+    app: notes-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

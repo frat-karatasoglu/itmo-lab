@@ -1,0 +1,16 @@
+# Постоянное хранилище для PostgreSQL. В minikube его автоматически создаёт
+# StorageClass "standard" (hostPath внутри ноды minikube).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: notes-db-data
+  labels:
+    app.kubernetes.io/name: notes-db
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: notes
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

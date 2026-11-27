@@ -7,6 +7,7 @@
 | 1 | Dockerfile | [ЛР 1. Dockerfile](#лр-1-dockerfile) |
 | 2 | Docker Compose | [ЛР 2. Docker Compose](#лр-2-docker-compose) |
 | 3 | Kubernetes | [ЛР 3. Kubernetes](#лр-3-kubernetes) |
+| 4 | More Kubernetes | [ЛР 4. More Kubernetes](#лр-4-more-kubernetes) |
 
 История изменений — в [CHANGES.md](CHANGES.md).
 
@@ -47,7 +48,8 @@ liveness/readiness probe в Kubernetes.
 ├── Dockerfile.bad       # плохой Dockerfile (ЛР 1)
 ├── docker-compose.yml   # ЛР 2
 ├── .env                 # переменные окружения для docker compose (ЛР 2)
-├── k8s/                 # манифесты Kubernetes (ЛР 3)
+├── k8s/                 # манифесты Kubernetes: Nextcloud (ЛР 3)
+│   └── notes/           # манифесты Notes API (ЛР 4)
 ├── .dockerignore
 ├── screenshots/
 ├── CHANGES.md
@@ -936,4 +938,151 @@ kubectl scale deployment postgres --replicas=1
 тот же том, и данные сохранятся. Для Nextcloud нужен отдельный том для
 `/var/www/html`, где лежат `config.php` и файлы пользователей. Иначе при любом
 перезапуске контейнера он будет пытаться установиться заново.
+
+---
+
+# ЛР 4. More Kubernetes
+
+Notes API из ЛР 1–2 развёрнут в Kubernetes (minikube) по аналогии с ЛР 3:
+PostgreSQL + API на **собственном образе** `notes-api:2.1.0`, собранном из
+`Dockerfile.good`. Роль init-сервиса `migrate` из ЛР 2 выполняет
+init-контейнер.
+
+## Архитектура
+
+```
+                       NodePort 30080
+                            │
+                 ┌──────────▼──────────┐
+                 │ Service notes-api   │
+                 └──────────┬──────────┘
+          ┌─────────────────┴─────────────────┐
+┌─────────▼─────────┐               ┌─────────▼─────────┐
+│ Pod notes-api #1  │               │ Pod notes-api #2  │   Deployment notes-api
+│ init: wait-for-db │               │ init: wait-for-db │   (replicas: 2)
+│ init: migrate     │               │ init: migrate     │
+│ api (uvicorn)     │               │ api (uvicorn)     │
+└─────────┬─────────┘               └─────────┬─────────┘
+          └─────────────────┬─────────────────┘
+                 ┌──────────▼──────────┐
+                 │ Service notes-db    │  ClusterIP, только внутри кластера
+                 └──────────┬──────────┘
+                 ┌──────────▼──────────┐
+                 │ Pod notes-db        │  Deployment notes-db (replicas: 1)
+                 │ postgres:16.6       │
+                 └──────────┬──────────┘
+                 ┌──────────▼──────────┐
+                 │ PVC notes-db-data   │  1Gi, данные переживают пересоздание пода
+                 └─────────────────────┘
+```
+
+## Манифесты (`k8s/notes/`)
+
+Файлы пронумерованы, поэтому `kubectl apply -f k8s/notes/` создаёт объекты в
+правильном порядке: сначала Secret и ConfigMap, потом то, что на них ссылается.
+
+| Файл | Объекты |
+|------|---------|
+| `01-secret.yml` | Secret `notes-db-secret`: `POSTGRES_USER`, `POSTGRES_PASSWORD` |
+| `02-configmap.yml` | ConfigMap `notes-config`: `POSTGRES_DB`, `DB_HOST`, `DB_PORT` |
+| `03-db-pvc.yml` | PersistentVolumeClaim `notes-db-data` (1Gi) |
+| `04-db.yml` | Deployment `notes-db` + Service `notes-db` (ClusterIP) |
+| `05-api.yml` | Deployment `notes-api` + Service `notes-api` (NodePort 30080) |
+
+## Как выполнены требования
+
+| Требование | Где выполнено |
+|------------|---------------|
+| Минимум два Deployment | `notes-db` и `notes-api` |
+| Кастомный образ | `notes-api:2.1.0` собирается из `Dockerfile.good` этого репозитория и не публикуется в registry |
+| Контейнер + init-контейнер | В поде `notes-api` два init-контейнера (`wait-for-db`, `migrate`) и основной контейнер `api` |
+| Volume | `notes-db` монтирует PVC `notes-db-data` в `/var/lib/postgresql/data` |
+| ConfigMap и/или Secret | Используются оба: `notes-config` и `notes-db-secret` подключаются через `envFrom` |
+| Service | `notes-db` (ClusterIP) и `notes-api` (NodePort) |
+| Liveness/Readiness | У обоих Deployment: `notes-api` — HTTP-пробы, `notes-db` — `pg_isready` |
+| Лейблы помимо selector | Рекомендуемые лейблы Kubernetes `app.kubernetes.io/name`, `component`, `part-of`, `version` на всех объектах |
+
+## Подробности
+
+**Init-контейнеры `notes-api`.** Выполняются по очереди, каждый должен
+завершиться с кодом 0, и только после этого стартует `api`:
+
+1. `wait-for-db` (образ `postgres:16.6-alpine`) в цикле вызывает `pg_isready`,
+   пока БД не начнёт принимать соединения. Это замена
+   `depends_on: condition: service_healthy` из ЛР 2: в Kubernetes нет
+   зависимостей между Deployment'ами.
+2. `migrate` (наш образ) запускает `python -m app.migrate` и создаёт таблицу.
+   При двух репликах миграция стартует в двух подах одновременно, поэтому
+   она выполняется под advisory-блокировкой PostgreSQL (`app/db.py`). Это
+   проверено: две одновременные миграции на пустой БД обе завершаются с кодом 0.
+
+**Пробы `notes-api`.**
+
+| Проба | Эндпоинт | Почему так |
+|-------|----------|------------|
+| `readinessProbe` | `/health` | Проверяет приложение **и** БД. Если БД недоступна, под уходит из Endpoints и не получает трафик |
+| `livenessProbe` | `/` | **Не** обращается к БД. Падение БД не вызывает бесполезных перезапусков API |
+
+Это вывод из ЛР 3: там liveness-проба Nextcloud зависела от БД, и после
+`scale postgres 0 → 1` kubelet перезапустил Nextcloud. Проверено: при
+остановленной БД `/` отвечает 200, а `/health` — 500.
+
+**PostgreSQL.**
+
+- Данные лежат на PVC, поэтому, в отличие от ЛР 3, переживают пересоздание пода.
+- `strategy: Recreate`: том `ReadWriteOnce` нельзя смонтировать в два пода
+  сразу, поэтому старый под должен остановиться раньше, чем стартует новый.
+- `PGDATA` указывает на подкаталог тома. В корне тома может лежать
+  `lost+found`, а `initdb` не работает в непустом каталоге.
+
+**Безопасность.** Контейнеры с нашим образом работают от пользователя
+`app` (UID 10001) из `Dockerfile.good`: `runAsNonRoot: true`,
+`allowPrivilegeEscalation: false`. `runAsUser` указан числом, потому что
+kubelet не может проверить `runAsNonRoot` для пользователя, заданного в образе
+по имени. БД доступна только внутри кластера (ClusterIP).
+
+## Запуск
+
+```bash
+minikube start
+
+# 1. Собрать собственный образ прямо в minikube (registry не нужен)
+minikube image build -t notes-api:2.1.0 -f Dockerfile.good .
+# альтернатива: docker compose build && minikube image load notes-api:2.1.0
+minikube image ls | grep notes-api
+
+# 2. Создать объекты (файлы применяются в порядке номеров)
+kubectl apply -f k8s/notes/
+
+# 3. Дождаться готовности
+kubectl get pods -l app.kubernetes.io/part-of=notes -w
+kubectl get all,pvc,configmap,secret -l app.kubernetes.io/part-of=notes
+
+# 4. Проверить
+minikube service notes-api --url      # адрес API
+curl <url>/
+curl -X POST <url>/notes -H 'Content-Type: application/json' -d '{"text":"from k8s"}'
+curl <url>/notes
+```
+
+Swagger UI: `<url>/docs`. Логи init-контейнеров:
+`kubectl logs <pod> -c wait-for-db` и `kubectl logs <pod> -c migrate`.
+
+Удаление: `kubectl delete -f k8s/notes/`. PVC тоже удалится вместе с данными.
+
+## Ход работы
+
+<!-- TODO (Яхья): по шагам со скриншотами:
+     minikube image build + minikube image ls (кастомный образ);
+     kubectl apply -f k8s/notes/;
+     kubectl get pods -w: Init:0/2 → Init:1/2 → PodInitializing → Running;
+     kubectl logs <api-pod> -c wait-for-db и -c migrate;
+     kubectl get all,pvc,configmap,secret -l app.kubernetes.io/part-of=notes;
+     kubectl get pods --show-labels;
+     kubectl describe pod <api-pod> — Init Containers, Liveness, Readiness;
+     curl/Swagger: POST и GET /notes через minikube service;
+     эксперимент с PVC: kubectl scale deployment notes-db --replicas=0, затем 1 —
+       заметки на месте (сравнить с ЛР 3);
+     эксперимент с пробами: при replicas=0 у notes-db поды notes-api 0/1,
+       RESTARTS не растёт; после возврата БД снова 1/1. -->
 

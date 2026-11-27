@@ -1,5 +1,14 @@
 # CHANGES
 
+## ЛР 4. More Kubernetes
+
+- Добавлен каталог `k8s/notes/`: Notes API + PostgreSQL в Kubernetes
+  (2 Deployment, init-контейнеры, PVC, Secret, ConfigMap, Service, пробы, лейблы).
+- Миграция выполняется под advisory-блокировкой PostgreSQL, чтобы init-контейнеры
+  нескольких реплик не конфликтовали.
+- Версия API и тег образа: 2.1.0 (также в `docker-compose.yml`).
+- В README добавлен раздел «ЛР 4».
+
 ## ЛР 3. Kubernetes
 
 - Добавлен каталог `k8s/` с манифестами Nextcloud + PostgreSQL на основе примера из задания.

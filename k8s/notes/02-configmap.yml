@@ -1,0 +1,12 @@
+# Несекретные настройки — те же переменные, что в .env из ЛР 2.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notes-config
+  labels:
+    app.kubernetes.io/name: notes-api
+    app.kubernetes.io/part-of: notes
+data:
+  POSTGRES_DB: "notes"
+  DB_HOST: "notes-db" # имя Service БД — его резолвит DNS кластера
+  DB_PORT: "5432"

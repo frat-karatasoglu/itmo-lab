@@ -5,7 +5,7 @@ x-notes-image: &notes-image
   build:
     context: .
     dockerfile: Dockerfile.good
-  image: notes-api:2.0.0
+  image: notes-api:2.1.0
   env_file: .env
   networks:
     - notes-net
