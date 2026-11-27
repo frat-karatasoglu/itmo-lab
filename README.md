@@ -845,9 +845,14 @@ Warning  Unhealthy  Liveness probe failed: HTTP probe failed with statuscode: 50
    отдавать `ERR_CONNECTION_RESET`: трафик просто некуда направлять.
 2. `livenessProbe` получает 500 три раза подряд → kubelet перезапускает
    контейнер (`RESTARTS 1`).
-3. После перезапуска entrypoint образа видит пустую базу и **ставит
-   Nextcloud заново**: в логе снова появляется `Nextcloud was successfully
-   installed`, таблицы `oc_*` создаются с нуля, под опять становится `1/1`.
+3. Перезапуск контейнера — это **новый контейнер из образа**, а не
+   возобновление старого процесса. Файловая система контейнера при этом
+   сбрасывается, и вместе с ней пропадает `config.php`, в котором стояло
+   `installed => true`: своего тома у Nextcloud в этих манифестах тоже нет.
+   Поэтому entrypoint образа видит пустую базу и чистый `/var/www/html` и
+   **ставит Nextcloud заново**: в логе снова появляется `Nextcloud was
+   successfully installed`, таблицы `oc_*` создаются с нуля, под опять
+   становится `1/1`.
 
 ![Пробы после эксперимента: 500, пустые Endpoints и перезапуск контейнера](screenshots/lab3-scale-probes.png)
 
